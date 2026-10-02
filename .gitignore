@@ -1,0 +1,21 @@
+# Build output
+/columna
+/columna.exe
+*.exe
+*.test
+*.out
+/dist/
+
+# Columna data files and service state
+*.columna
+*.columna.tmp
+.idempotency.json
+.idempotency.json.tmp
+/data/
+/tmp/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
