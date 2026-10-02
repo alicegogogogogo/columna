@@ -247,6 +247,68 @@ value for it, and a skipped page holds no row that the table above admits. So
 `max_pages_per_group` applies by page index in both modes and so leaves the rows
 unchanged too.
 
+## Scan cost estimation
+
+Before reading any data, a caller can ask which of several files or shards is
+cheapest to scan. The estimator is metadata only — `EstimateScanCost` never
+opens a page payload and never writes or rewrites a file — and it is opt in:
+nothing in the query path changes unless it is called explicitly.
+
+```go
+result, err := columna.EstimateScanCost(columna.ScanRequest{
+    Sources:       candidates,        // candidate files or shards
+    ReadColumns:   []string{"id", "region"},
+    ProjectionColumns: []string{"region"},
+    Predicates:    []columna.CostPredicate{...},
+    Limit:         &limit,            // nil means unlimited
+    SortRows:      0,                 // rows a sort must consume first
+})
+result.Selected      // cheapest candidate; "" only when limit is zero
+result.Candidates[i] // estimate of candidate i, in input order
+```
+
+Each `CandidateSource` carries its row count, its row group and page
+boundaries, per-column per-page byte counts, null counts, distinct counts and
+the available min/max values. Every estimate reports, in input order, the row
+groups and pages expected to be read, the bytes and values decoded, the rows
+left after filtering, the returned-row cap, a human-readable reason, whether
+the statistics were complete and one unitless cost:
+
+```
+cost = bytes / 1000 + 0.01 * decoded_values + 0.001 * processed_rows
+```
+
+Estimation first drops columns that are neither projected nor filtered, then
+prunes row groups and pages whose statistics make a predicate hit impossible
+(reusing the same rules as predicate pushdown), and then sizes the remainder.
+Selectivity follows fixed rules:
+
+| predicate | selectivity |
+| --- | --- |
+| `col = v` | non-null fraction ÷ distinct count |
+| range / `between` | overlap of the predicate interval with `[min, max]`, times the non-null fraction (the non-null fraction for strings when the intervals overlap) |
+| `IS NULL` / `IS NOT NULL` | null fraction / non-null fraction |
+
+A positive `limit` lets the scan stop early at page granularity; `SortRows` is
+how many filtered rows a sort must consume before that stop can happen. The
+returned-row cap is `min(filtered rows, limit)`; limit zero returns zero-cost
+estimates and selects no candidate. Missing statistics are never treated as
+zero cost: the selectivity defaults to one and `incomplete_statistics` is set.
+Equal input and equal metadata always produce an equal result, and a cost tie
+selects the first input candidate.
+
+The footer already stores everything except a distinct value count, so
+`ReadFileMetadata` parses a file's footer alone and `(*FileMetadata).Candidate`
+(or `TableCandidate` for a loaded table) builds a candidate from it, passing a
+zero distinct count; equality estimates built this way are flagged
+`incomplete_statistics` rather than under-costed.
+
+Invalid input — an empty candidate list, negative row/page/byte/null counts,
+nulls above a page's row count, a max below its min, or distinct values above
+its non-null row count — returns `InvalidArgumentError`. A predicate type or
+operator the model cannot price returns `UnsupportedPredicateError`, checked
+up front so no partial estimate is ever returned.
+
 ## Tests
 
 ```bash
