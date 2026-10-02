@@ -247,6 +247,50 @@ value for it, and a skipped page holds no row that the table above admits. So
 `max_pages_per_group` applies by page index in both modes and so leaves the rows
 unchanged too.
 
+## Scan cost estimation
+
+`EstimateScan` (internal/columna/estimate.go) prices a scan against several
+candidate sources — files or shards — before any data is read, and picks the
+cheapest candidate. It is a pure function of the statistics it is given: it
+never opens a candidate's data and never writes a file, and the same request
+always produces the same answer, with cost ties broken in favour of the
+candidate that comes first in the input. The query engine does not call it;
+unless a caller explicitly estimates, query results and execution order are
+exactly as before.
+
+The request carries the candidates, the columns the scan would read, the
+projection, the predicates, a `limit` and `sort_rows` (the row count an
+ordering operator must receive). Each candidate supplies its row count, row
+group or page boundaries, and per-column byte counts, null counts, distinct
+value counts and, where available, min/max. Estimation first drops read
+columns that neither the projection nor a predicate needs, then prunes pages
+whose statistics cannot satisfy a predicate (the same rule the engine's
+pushdown uses), and finally charges for what survives. The unified cost is
+
+```
+cost = bytes/1000 * 1 + decoded_values * 0.01 + unpruned_rows * 0.001
+```
+
+Selectivities: an equality predicate is the non-null ratio divided by the
+distinct count; a range predicate is the overlap of its numeric (or date-like)
+interval with the recorded `[min, max]`, times the non-null ratio; `is_null`
+is the null ratio and `is_not_null` the non-null ratio. Missing statistics
+never lower a cost: the selectivity falls back to 1 and the candidate is
+flagged `incomplete_statistics`. A positive limit (or a larger `sort_rows`)
+stops the scan once the estimated matching rows cover it, and the returned-row
+cap is the smaller of the estimated filtered rows and the limit; a zero limit
+makes every candidate free and selects none.
+
+Every candidate is reported in input order with its estimated row groups,
+pages, bytes, decoded values, unpruned rows, filtered rows, return-row cap,
+selection reason, completeness flag and cost, and the result names the
+lowest-cost candidate. A request with no candidate, a negative row/byte/null
+count, a null count above its page's rows, a maximum below its minimum or a
+distinct count above the non-null rows is rejected with
+`InvalidArgumentError`; a predicate operator or column type the model cannot
+price (for example a range predicate on a string column) is rejected with
+`UnsupportedPredicateError` rather than estimated halfway.
+
 ## Tests
 
 ```bash
@@ -256,4 +300,5 @@ go test ./...
 ```
 
 `tests/format_test.go` covers the codecs, page layouts and footer statistics;
-`tests/engine_test.go` the query engine, the append path and all-NULL pages.
+`tests/engine_test.go` the query engine, the append path and all-NULL pages;
+`tests/estimate_test.go` the scan cost estimator and its source selection.
